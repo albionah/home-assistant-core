@@ -71,6 +71,7 @@ from .const import (
     CONF_MIN_TEMP,
     CONF_PRESETS,
     CONF_SENSOR,
+    CONF_CORRECTION_SENSOR,
     DEFAULT_TOLERANCE,
     DOMAIN,
     PLATFORMS,
@@ -78,7 +79,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_NAME = "Generic Thermostat"
+DEFAULT_NAME = "Smart Thermostat"
 
 CONF_INITIAL_HVAC_MODE = "initial_hvac_mode"
 CONF_KEEP_ALIVE = "keep_alive"
@@ -95,6 +96,7 @@ PLATFORM_SCHEMA_COMMON = vol.Schema(
     {
         vol.Required(CONF_HEATER): cv.entity_id,
         vol.Required(CONF_SENSOR): cv.entity_id,
+        vol.Required(CONF_CORRECTION_SENSOR): cv.entity_id,
         vol.Optional(CONF_AC_MODE): cv.boolean,
         vol.Optional(CONF_MAX_TEMP): vol.Coerce(float),
         vol.Optional(CONF_MIN_DUR): cv.positive_time_period,
@@ -143,7 +145,7 @@ async def async_setup_platform(
     async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the generic thermostat platform."""
+    """Set up the smart thermostat platform."""
 
     await async_setup_reload_service(hass, DOMAIN, PLATFORMS)
     await _async_setup_config(
@@ -157,11 +159,12 @@ async def _async_setup_config(
     unique_id: str | None,
     async_add_entities: AddEntitiesCallback | AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the generic thermostat platform."""
+    """Set up the smart thermostat platform."""
 
     name: str = config[CONF_NAME]
     heater_entity_id: str = config[CONF_HEATER]
     sensor_entity_id: str = config[CONF_SENSOR]
+    correction_entity_id: str = config[CONF_CORRECTION_SENSOR]
     min_temp: float | None = config.get(CONF_MIN_TEMP)
     max_temp: float | None = config.get(CONF_MAX_TEMP)
     target_temp: float | None = config.get(CONF_TARGET_TEMP)
@@ -180,11 +183,12 @@ async def _async_setup_config(
 
     async_add_entities(
         [
-            GenericThermostat(
+            SmartThermostat(
                 hass,
                 name,
                 heater_entity_id,
                 sensor_entity_id,
+                correction_entity_id,
                 min_temp,
                 max_temp,
                 target_temp,
@@ -272,6 +276,14 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
             self._attr_preset_modes = [PRESET_NONE]
         self._presets = presets
         self._presets_inv = {v: k for k, v in presets.items()}
+
+    @property
+    def _target_temp(self):
+        return self._original_target_temp
+
+    @_target_temp.setter
+    def _target_temp(self, value):
+        self._original_target_temp = value
 
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added."""
@@ -612,3 +624,150 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
             await self._async_control_heating(force=True)
 
         self.async_write_ha_state()
+
+
+class SmartThermostat(GenericThermostat):
+    """Representation of a Smart Thermostat device."""
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        name: str,
+        heater_entity_id: str,
+        sensor_entity_id: str,
+        correction_entity_id: str,
+        min_temp: float | None,
+        max_temp: float | None,
+        target_temp: float | None,
+        ac_mode: bool | None,
+        min_cycle_duration: timedelta | None,
+        cold_tolerance: float,
+        hot_tolerance: float,
+        keep_alive: timedelta | None,
+        initial_hvac_mode: HVACMode | None,
+        presets: dict[str, float],
+        precision: float | None,
+        target_temperature_step: float | None,
+        unit: UnitOfTemperature,
+        unique_id: str | None,
+    ) -> None:
+        """Initialize the thermostat."""
+        self._original_target_temp = target_temp
+        self._correction_temp = 0
+        super().__init__(
+            hass,
+            name,
+            heater_entity_id,
+            sensor_entity_id,
+            min_temp,
+            max_temp,
+            target_temp,
+            ac_mode,
+            min_cycle_duration,
+            cold_tolerance,
+            hot_tolerance,
+            keep_alive,
+            initial_hvac_mode,
+            presets,
+            precision,
+            target_temperature_step,
+            unit,
+            unique_id,
+        )
+        self.correction_entity_id = correction_entity_id
+
+    @property
+    def _target_temp(self):
+        """Getter for the target temperature with correction."""
+        if self._attr_preset_mode == PRESET_NONE:
+            return super()._target_temp
+        else:
+            return super()._target_temp + self._correction_temp()
+
+    @_target_temp.setter
+    def _target_temp(self, value):
+        """Setter for the target temperature."""
+        self._original_target_temp = value
+
+    def _get_correction(self):
+        """Vrací hodnotu korekce."""
+        state = self.hass.states.get(self.correction_entity_id)
+        if state is None:
+            _LOGGER.error("Correction entity '%s' not found.", self.correction_entity_id)
+            return 0.0
+
+        if state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            _LOGGER.error(
+                "Correction entity '%s' has invalid state: %s",
+                self.correction_entity_id,
+                state.state,
+            )
+            return 0.0
+
+        try:
+            correction = float(state.state)
+            return correction
+        except ValueError:
+            _LOGGER.error(
+                "Correction entity '%s' has non-numeric state: %s",
+                self.correction_entity_id,
+                state.state,
+            )
+            return 0.0
+        
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Set new preset mode."""
+        if preset_mode not in (self.preset_modes or []):
+            raise ValueError(
+                f"Got unsupported preset_mode {preset_mode}. Must be one of"
+                f" {self.preset_modes}"
+            )
+        if preset_mode == self._attr_preset_mode:
+            # I don't think we need to call async_write_ha_state if we didn't change the state
+            return
+        if preset_mode == PRESET_NONE:
+            self._attr_preset_mode = PRESET_NONE
+            self._target_temp = self._saved_target_temp
+            await self._async_control_heating(force=True)
+        else:
+            if self._attr_preset_mode == PRESET_NONE:
+                self._saved_target_temp = self._original_target_temp
+            self._attr_preset_mode = preset_mode
+            self._target_temp = self._presets[preset_mode]
+            await self._async_control_heating(force=True)
+
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Run when entity about to be added."""
+        await super().async_added_to_hass()
+
+        # Add listener
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass, [self.correction_entity_id], self._async_correction_sensor_changed
+            )
+        )
+
+    async def _async_correction_sensor_changed(self, event: Event[EventStateChangedData]) -> None:
+        """Handle correction sensor changes."""
+        new_state = event.data["new_state"]
+        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+
+        self._async_update_correction_sensor(new_state)
+        await self._async_control_heating()
+        self.async_write_ha_state()
+
+    @callback
+    def _async_update_correction_temperature(self, state: State) -> None:
+        """Update correction temperature with latest state from sensor."""
+        try:
+            correction_temp = float(state.state)
+            if not math.isfinite(correction_temp):
+                raise ValueError(f"Correction sensor has illegal state {state.state}")  # noqa: TRY301
+            self._correction_temp = correction_temp
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from sensor: %s", ex)
