@@ -277,14 +277,6 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
         self._presets = presets
         self._presets_inv = {v: k for k, v in presets.items()}
 
-    @property
-    def _target_temp(self):
-        return self._original_target_temp
-
-    @_target_temp.setter
-    def _target_temp(self, value):
-        self._original_target_temp = value
-
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added."""
         await super().async_added_to_hass()
@@ -625,6 +617,14 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
 
         self.async_write_ha_state()
 
+    @property
+    def _target_temp(self):
+        return self._original_target_temp
+
+    @_target_temp.setter
+    def _target_temp(self, value):
+        self._original_target_temp = value
+
 
 class SmartThermostat(GenericThermostat):
     """Representation of a Smart Thermostat device."""
@@ -684,38 +684,12 @@ class SmartThermostat(GenericThermostat):
         if self._attr_preset_mode == PRESET_NONE:
             return super()._target_temp
         else:
-            return super()._target_temp + self._correction_temp()
+            return super()._target_temp - self._correction_temp
 
     @_target_temp.setter
     def _target_temp(self, value):
         """Setter for the target temperature."""
         self._original_target_temp = value
-
-    def _get_correction(self):
-        """Vrací hodnotu korekce."""
-        state = self.hass.states.get(self.correction_entity_id)
-        if state is None:
-            _LOGGER.error("Correction entity '%s' not found.", self.correction_entity_id)
-            return 0.0
-
-        if state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
-            _LOGGER.error(
-                "Correction entity '%s' has invalid state: %s",
-                self.correction_entity_id,
-                state.state,
-            )
-            return 0.0
-
-        try:
-            correction = float(state.state)
-            return correction
-        except ValueError:
-            _LOGGER.error(
-                "Correction entity '%s' has non-numeric state: %s",
-                self.correction_entity_id,
-                state.state,
-            )
-            return 0.0
         
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set new preset mode."""
@@ -757,7 +731,7 @@ class SmartThermostat(GenericThermostat):
         if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             return
 
-        self._async_update_correction_sensor(new_state)
+        self._async_update_correction_temperature(new_state)
         await self._async_control_heating()
         self.async_write_ha_state()
 
